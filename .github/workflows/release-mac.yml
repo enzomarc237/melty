@@ -1,0 +1,114 @@
+name: Release macOS
+
+on:
+  push:
+    branches:
+      - main
+
+jobs:
+  build:
+    name: Build macOS (${{ matrix.arch }})
+    runs-on: ${{ matrix.runner }}
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x64
+            runner: macos-13
+          - arch: arm64
+            runner: macos-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version-file: .nvmrc
+
+      - name: Install dependencies
+        run: |
+          yarn --frozen-lockfile
+          cd "$GITHUB_WORKSPACE/extensions/spectacular" && npm ci
+          cd "$GITHUB_WORKSPACE/extensions/spectacular/webview-ui" && npm ci
+
+      - name: Compile build
+        env:
+          NODE_OPTIONS: --max-old-space-size=8192
+          VSCODE_ARCH: ${{ matrix.arch }}
+          VSCODE_PLATFORM: darwin
+        run: |
+          yarn gulp compile-build
+          yarn gulp compile-extension-media
+          yarn gulp compile-extensions-build
+          yarn gulp minify-vscode
+          yarn gulp "vscode-darwin-${{ matrix.arch }}-min"
+
+      - name: Install create-dmg
+        run: npm install -g create-dmg
+
+      - name: Package artifacts
+        run: |
+          APP_DIR="$GITHUB_WORKSPACE/../VSCode-darwin-${{ matrix.arch }}"
+          ASSETS_DIR="$GITHUB_WORKSPACE/assets"
+          SHORT_SHA="${GITHUB_SHA::8}"
+          mkdir -p "${ASSETS_DIR}"
+
+          echo "Building ZIP"
+          (cd "${APP_DIR}" && zip -r -X -y "${ASSETS_DIR}/Melty-darwin-${{ matrix.arch }}-${SHORT_SHA}.zip" ./*.app)
+
+          echo "Building DMG"
+          (cd "${APP_DIR}" && create-dmg ./*.app .) || echo "create-dmg exited with non-zero status (may be a known codesign warning); continuing"
+          DMG=$(ls "${APP_DIR}"/*.dmg 2>/dev/null | head -n 1)
+          if [[ -n "${DMG}" ]]; then
+            mv "${DMG}" "${ASSETS_DIR}/Melty.${{ matrix.arch }}.${SHORT_SHA}.dmg"
+          fi
+
+      - name: Upload ZIP artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: Melty-darwin-${{ matrix.arch }}-zip
+          path: assets/Melty-darwin-${{ matrix.arch }}-*.zip
+          if-no-files-found: error
+
+      - name: Upload DMG artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: Melty-darwin-${{ matrix.arch }}-dmg
+          path: assets/Melty.${{ matrix.arch }}.*.dmg
+          if-no-files-found: warn
+
+  draft-release:
+    name: Draft GitHub Release
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist/
+
+      - name: Set short SHA
+        run: echo "SHORT_SHA=${GITHUB_SHA::8}" >> "$GITHUB_ENV"
+
+      - name: Read version from package.json
+        id: version
+        run: echo "version=$(node -p "require('./package.json').version")" >> "$GITHUB_OUTPUT"
+
+      - name: Draft release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v${{ steps.version.outputs.version }}-${{ env.SHORT_SHA }}
+          name: Melty v${{ steps.version.outputs.version }}
+          draft: true
+          generate_release_notes: true
+          files: dist/**/*
